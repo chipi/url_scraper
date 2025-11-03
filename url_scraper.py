@@ -140,6 +140,7 @@ class CrawlConfig:
     user_agent: str = DEFAULT_USER_AGENT
     timeout: int = 15
     delay_ms: int = 0
+    ignore_paths: List[str] = None  # path prefixes like /videos, /assets
 
 
 def build_robot_parser(start_url: str, user_agent: str, timeout: int) -> Optional[robotparser.RobotFileParser]:
@@ -156,6 +157,24 @@ def build_robot_parser(start_url: str, user_agent: str, timeout: int) -> Optiona
         return None
 
 
+def _normalize_ignore_paths(ignore_paths: Optional[List[str]]) -> List[str]:
+    if not ignore_paths:
+        return []
+    normalized: List[str] = []
+    for raw in ignore_paths:
+        if not raw:
+            continue
+        for part in [p.strip() for p in str(raw).split(",")]:
+            if not part:
+                continue
+            p = part if part.startswith("/") else "/" + part
+            # Remove trailing slashes for consistent prefix comparison (except root)
+            if len(p) > 1:
+                p = p.rstrip("/")
+            normalized.append(p)
+    return normalized
+
+
 def crawl(config: CrawlConfig) -> List[str]:
     start = normalize_url(config.start_url, config.start_url)
     if not start:
@@ -165,6 +184,8 @@ def crawl(config: CrawlConfig) -> List[str]:
     discovered: Set[str] = set()
     queue: collections.deque[Tuple[str, int]] = collections.deque()
     queue.append((start, 0))
+
+    ignored_prefixes = _normalize_ignore_paths(config.ignore_paths)
 
     rp = build_robot_parser(start, config.user_agent, config.timeout) if config.respect_robots else None
 
@@ -202,6 +223,13 @@ def crawl(config: CrawlConfig) -> List[str]:
         for link in links:
             if config.same_domain_only and not is_same_domain(start, link):
                 continue
+            if ignored_prefixes:
+                link_path = urlparse(link).path or "/"
+                # Normalize path similar to ignore prefixes: remove trailing slash except root
+                if len(link_path) > 1:
+                    link_path = link_path.rstrip("/")
+                if any(link_path.startswith(prefix) for prefix in ignored_prefixes):
+                    continue
             if link not in visited:
                 queue.append((link, depth + 1))
 
@@ -243,6 +271,12 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default=None,
         help="Optional output file to write URLs to (one per line)",
     )
+    parser.add_argument(
+        "--ignore-path",
+        action="append",
+        default=[],
+        help="Path prefixes to skip (repeatable or comma-separated), e.g. /videos,/assets",
+    )
     return parser.parse_args(argv)
 
 
@@ -258,6 +292,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         user_agent=args.user_agent,
         timeout=max(1, args.timeout),
         delay_ms=max(0, args.delay_ms),
+        ignore_paths=args.ignore_path,
     )
 
     try:

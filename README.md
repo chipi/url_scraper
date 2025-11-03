@@ -34,6 +34,12 @@ python3 url_scraper.py https://example.com --no-robots
 
 # Add delay between requests (politeness)
 python3 url_scraper.py https://example.com --delay-ms 250
+
+# Skip paths like /videos and /assets during crawl
+python3 url_scraper.py https://example.com --ignore-path /videos --ignore-path /assets
+
+# Comma-separated ignore list in a single flag
+python3 url_scraper.py https://example.com --ignore-path /videos,/assets,/downloads
 ```
 
 ## Options
@@ -45,6 +51,7 @@ python3 url_scraper.py https://example.com --delay-ms 250
 - `--user-agent` (str): User-Agent header to use
 - `--timeout` (int): Request timeout in seconds (default: 15)
 - `--delay-ms` (int): Politeness delay between requests in milliseconds
+- `--ignore-path` (repeatable or comma-separated): Path prefixes to skip (e.g., `/videos`, `/assets`)
 - `-o, --output` (path): Optional output file to write URLs to (one per line)
 
 ## Notes
