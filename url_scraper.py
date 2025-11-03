@@ -174,6 +174,12 @@ def crawl(config: CrawlConfig) -> List[str]:
             continue
         visited.add(current)
 
+        try:
+            sys.stderr.write(f"[{len(visited)}/{config.max_pages}] depth={depth} fetching {current}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+
         if config.respect_robots and rp is not None:
             try:
                 if not rp.can_fetch(config.user_agent, current):
@@ -198,6 +204,14 @@ def crawl(config: CrawlConfig) -> List[str]:
                 continue
             if link not in visited:
                 queue.append((link, depth + 1))
+
+        try:
+            sys.stderr.write(
+                f"    + links found: {len(links)} | discovered: {len(discovered)} | queue: {len(queue)}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
 
         if config.delay_ms > 0:
             time.sleep(config.delay_ms / 1000.0)
@@ -246,7 +260,26 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         delay_ms=max(0, args.delay_ms),
     )
 
+    try:
+        sys.stderr.write(
+            "Starting crawl\n"
+            f"  source: {cfg.start_url}\n"
+            f"  max_pages: {cfg.max_pages}, max_depth: {cfg.max_depth}\n"
+            f"  same_domain_only: {cfg.same_domain_only}, respect_robots: {cfg.respect_robots}\n"
+        )
+        sys.stderr.flush()
+    except Exception:
+        pass
+
     urls = crawl(cfg)
+
+    try:
+        sys.stderr.write(
+            f"Finished. pages_fetched: {len(urls)} (unique URLs listed).\n"
+        )
+        sys.stderr.flush()
+    except Exception:
+        pass
 
     if args.output:
         try:
