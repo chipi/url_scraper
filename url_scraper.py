@@ -2,6 +2,8 @@
 
 import argparse
 import collections
+import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -128,6 +130,288 @@ def extract_links(base_url: str, html: str) -> List[str]:
         if norm:
             normalized.append(norm)
     return normalized
+
+
+class MainContentExtractor(HTMLParser):
+    """
+    Heuristic main-content text extractor using only stdlib.
+    - Prefers content within <main>, <article>, or role="main".
+    - Excludes typical chrome: nav, header, footer, aside, menu, form, script, style, noscript.
+    - Captures text and in-content links; simple paragraph handling.
+    """
+
+    EXCLUDE_TAGS = {"script", "style", "noscript", "template", "svg"}
+    CHROME_TAGS = {"nav", "header", "footer", "aside", "menu", "form"}
+    BLOCK_TAGS = {
+        "p",
+        "div",
+        "section",
+        "article",
+        "main",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "li",
+    }
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._stack: List[str] = []
+        self._in_main_like: int = 0
+        self._suppress: int = 0
+        self._buffer: List[str] = []
+        self._paragraph_open: bool = False
+        self._links: List[str] = []
+        self._title: List[str] = []
+        self._in_title: bool = False
+        # Attribute-based exclusion patterns (breadcrumbs, share, back, meta, related)
+        self._exclude_attr_regex = re.compile(
+            r"\b(breadcrumbs?|crumb|share|social|sns|back(-to)?|post-(meta|nav)|byline|related|tags|tag-list|follow-us|share-tools)\b",
+            re.IGNORECASE,
+        )
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        tag_lower = tag.lower()
+        self._stack.append(tag_lower)
+
+        if tag_lower == "title":
+            self._in_title = True
+
+        if tag_lower in self.EXCLUDE_TAGS:
+            self._suppress += 1
+            return
+
+        # Detect main-like region
+        if tag_lower in ("main", "article"):
+            self._in_main_like += 1
+        else:
+            # role="main"
+            for (attr, val) in attrs:
+                if attr.lower() == "role" and (val or "").lower() == "main":
+                    self._in_main_like += 1
+                    break
+
+        # Exclude chrome sections fully if outside an explicit main-like already
+        if self._in_main_like == 0 and tag_lower in self.CHROME_TAGS:
+            self._suppress += 1
+
+        # Inside main-like, suppress typical non-content blocks by class/id/aria-label/role
+        if self._in_main_like > 0 and self._suppress == 0:
+            if self._attrs_match_decorative(attrs):
+                self._suppress += 1
+
+        # Capture links when in main-like and not suppressed
+        if self._in_main_like > 0 and self._suppress == 0 and tag_lower == "a":
+            href_val: Optional[str] = None
+            for (attr, val) in attrs:
+                if attr.lower() == "href":
+                    href_val = val
+                    break
+            if href_val:
+                self._links.append(href_val)
+
+        # Paragraph-like separation
+        if tag_lower in self.BLOCK_TAGS and self._in_main_like > 0 and self._suppress == 0:
+            if self._paragraph_open:
+                self._buffer.append("\n\n")
+            self._paragraph_open = True
+
+    def handle_endtag(self, tag: str) -> None:
+        tag_lower = tag.lower()
+        # Title handling
+        if tag_lower == "title":
+            self._in_title = False
+
+        if tag_lower in self.EXCLUDE_TAGS and self._suppress > 0:
+            self._suppress -= 1
+
+        if tag_lower in ("main", "article") and self._in_main_like > 0:
+            self._in_main_like -= 1
+
+        if self._in_main_like == 0 and tag_lower in self.CHROME_TAGS and self._suppress > 0:
+            self._suppress -= 1
+
+        # Close suppression for decorative blocks matched by attrs
+        if self._in_main_like >= 0 and self._suppress > 0 and self._stack:
+            # Best-effort: when closing current tag, allow suppression to unwind
+            # only if this end tag corresponds to a block-level likely suppressed section
+            if tag_lower in {"div", "section", "ul", "ol", "nav", "header", "footer", "aside"}:
+                self._suppress -= 1
+
+        if tag_lower in self.BLOCK_TAGS and self._paragraph_open:
+            # End of paragraph-like block
+            self._paragraph_open = False
+
+        if self._stack and self._stack[-1] == tag_lower:
+            self._stack.pop()
+
+    def _attrs_match_decorative(self, attrs: List[Tuple[str, Optional[str]]]) -> bool:
+        for (attr, val) in attrs:
+            if val is None:
+                continue
+            name = attr.lower()
+            value = str(val)
+            if name in ("class", "id", "aria-label", "role", "name"):
+                if self._exclude_attr_regex.search(value):
+                    return True
+        return False
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title:
+            self._title.append(data)
+        if self._in_main_like == 0 or self._suppress > 0:
+            return
+        text = data.strip()
+        if not text:
+            return
+        # Collapse internal whitespace
+        text = re.sub(r"\s+", " ", text)
+        self._buffer.append(text + " ")
+
+    def get_title(self) -> str:
+        title = re.sub(r"\s+", " ", "".join(self._title).strip())
+        return title
+
+    def get_text(self) -> str:
+        # Normalize whitespace; ensure paragraphs are separated
+        text = "".join(self._buffer)
+        # Clean up excessive spaces around newlines
+        text = re.sub(r"\s*\n\s*", "\n", text)
+        # Collapse multiple newlines to max two
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        # Final trim
+        text = text.strip()
+        return text
+
+    def get_links(self) -> List[str]:
+        return list(self._links)
+
+
+def extract_main_content_and_links(base_url: str, html: str) -> Tuple[str, str, List[str]]:
+    """
+    Returns (title, text, reference_links).
+    Links are normalized and de-duplicated, relative to base_url.
+    """
+    parser = MainContentExtractor()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:
+        pass
+    title = parser.get_title()
+    text = parser.get_text()
+    text = clean_decorative_blocks(text)
+
+    raw_links = parser.get_links()
+    refs: List[str] = []
+    seen: Set[str] = set()
+    for raw in raw_links:
+        norm = normalize_url(base_url, raw)
+        if norm and norm not in seen:
+            seen.add(norm)
+            refs.append(norm)
+
+    return title, text, refs
+
+
+def _is_decorative_line(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return True
+    # Common back/share phrases
+    if re.search(r"^(←|<−|<–|<-)?\s*(back|go back|return|previous|home)\b", s, re.IGNORECASE):
+        return True
+    if re.search(r"\b(share|share this|follow us|connect with us)\b", s, re.IGNORECASE):
+        return True
+    # Lines mostly consisting of social network names
+    if re.search(r"\b(twitter|x|facebook|fb|linkedin|reddit|email|whatsapp|wechat|telegram|pinterest)\b", s, re.IGNORECASE):
+        # Short lines with only social names are decorative
+        if len(s) <= 64:
+            return True
+    return False
+
+
+def clean_decorative_blocks(text: str) -> str:
+    if not text.strip():
+        return text
+    lines = text.split("\n")
+    # Trim leading decorative lines
+    start = 0
+    while start < len(lines) and _is_decorative_line(lines[start]):
+        start += 1
+    # Trim trailing decorative lines
+    end = len(lines) - 1
+    while end >= start and _is_decorative_line(lines[end]):
+        end -= 1
+    cleaned = lines[start : end + 1]
+    # Also drop isolated short decorative blocks inside: collapse sequences
+    out: List[str] = []
+    i = 0
+    while i < len(cleaned):
+        if _is_decorative_line(cleaned[i]):
+            # Collapse multiple decorative lines into a single blank between content blocks
+            while i < len(cleaned) and _is_decorative_line(cleaned[i]):
+                i += 1
+            if out and i < len(cleaned):
+                out.append("")
+            continue
+        out.append(cleaned[i])
+        i += 1
+    # Remove excessive blank lines
+    joined = "\n".join(out)
+    joined = re.sub(r"\n{3,}", "\n\n", joined).strip()
+    return joined
+
+
+def sanitize_filename_from_url(url: str, max_len: int = 180) -> str:
+    parts = urlparse(url)
+    host = (parts.hostname or "site").lower()
+    path = parts.path or "/"
+    if path.endswith("/"):
+        path = path[:-1]
+    if not path:
+        path = "/"
+    # Replace separators with dashes; keep alnum and a few safe chars
+    raw = host + ("-" + path.strip("/").replace("/", "-") if path != "/" else "")
+    raw = raw if raw else host
+    raw = re.sub(r"[^A-Za-z0-9._-]+", "-", raw)
+    raw = re.sub(r"-+", "-", raw).strip("-._")
+    if not raw:
+        raw = host
+    # Append short hash from full URL to avoid collisions when needed
+    suffix = hex(abs(hash(url)) & 0xFFFF)[2:]
+    name = raw[: max(1, max_len - len(suffix) - 1)] + "-" + suffix
+    return name + ".txt"
+
+
+def ensure_dir(path: str) -> None:
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+
+
+def build_text_document(url: str, title: str, body_text: str, refs: List[str]) -> str:
+    header_lines: List[str] = []
+    title_line = title.strip() if title.strip() else url
+    header_lines.append(title_line)
+    header_lines.append(url)
+    header_lines.append("".rjust(len(url), "="))
+    header = "\n".join(header_lines)
+
+    sections = [header]
+    if body_text.strip():
+        sections.append("")
+        sections.append(body_text.strip())
+    if refs:
+        sections.append("")
+        sections.append("Reference links:")
+        sections.append("-----------------")
+        sections.extend(refs)
+    return "\n".join(sections).rstrip() + "\n"
 
 
 @dataclass
@@ -277,6 +561,11 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
         default=[],
         help="Path prefixes to skip (repeatable or comma-separated), e.g. /videos,/assets",
     )
+    parser.add_argument(
+        "--download-dir",
+        default=None,
+        help="Optional directory to save cleaned main-content as .txt files (one per URL)",
+    )
     return parser.parse_args(argv)
 
 
@@ -324,6 +613,44 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         except Exception as e:
             print(f"Failed to write output file: {e}", file=sys.stderr)
             # Still print to stdout
+
+    # Optional: download cleaned content for each URL
+    if args.download_dir:
+        ensure_dir(args.download_dir)
+        try:
+            sys.stderr.write(f"Downloading cleaned content into: {args.download_dir}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+        saved = 0
+        for u in urls:
+            html, final_url = fetch_html(u, cfg.user_agent, cfg.timeout)
+            if html is None:
+                continue
+            base = normalize_url(final_url or u, final_url or u) or u
+            title, text, refs = extract_main_content_and_links(base, html)
+            # Build document and write
+            doc = build_text_document(base, title, text, refs)
+            filename = sanitize_filename_from_url(base)
+            file_path = os.path.join(args.download_dir, filename)
+            try:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(doc)
+                saved += 1
+                try:
+                    sys.stderr.write(f"  saved: {file_path}\n")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+            except Exception:
+                continue
+
+        try:
+            sys.stderr.write(f"Saved {saved} files.\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
 
     for u in urls:
         print(u)

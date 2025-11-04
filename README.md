@@ -40,6 +40,9 @@ python3 url_scraper.py https://example.com --ignore-path /videos --ignore-path /
 
 # Comma-separated ignore list in a single flag
 python3 url_scraper.py https://example.com --ignore-path /videos,/assets,/downloads
+
+# Download cleaned main-content as text files into a directory (one file per URL)
+python3 url_scraper.py https://example.com --download-dir ./pages
 ```
 
 ## Options
@@ -53,9 +56,14 @@ python3 url_scraper.py https://example.com --ignore-path /videos,/assets,/downlo
 - `--delay-ms` (int): Politeness delay between requests in milliseconds
 - `--ignore-path` (repeatable or comma-separated): Path prefixes to skip (e.g., `/videos`, `/assets`)
 - `-o, --output` (path): Optional output file to write URLs to (one per line)
+- `--download-dir` (path): Optional directory to save cleaned main-content as `.txt` files (one per URL)
 
 ## Notes
 
 - By default, the crawler respects `robots.txt` and stays within the start domain.
 - URLs are normalized (fragment removed, default ports stripped) and printed one per line.
+- If `--download-dir` is provided, each crawled page is fetched again and saved as a plain text file containing:
+  - Title (or URL if no title), URL, and underline header
+  - Cleaned main content (heuristic: prefers `<main>`, `<article>`, `role="main"`; excludes nav/header/footer/aside/script/style)
+  - A "Reference links" section listing in-content links normalized to absolute URLs
 
